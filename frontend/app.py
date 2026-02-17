@@ -1,61 +1,140 @@
 """
 ==========================================================
-STREAMLIT FRONTEND — app.py
+STREAMLIT FRONTEND — app.py (Standalone Version)
 ==========================================================
 
 WHAT THIS FILE DOES:
 --------------------
-This is the FRONTEND of our Customer Churn Prediction System.
-It creates a beautiful web interface where users can:
+This is the COMPLETE frontend for the Customer Churn Prediction System.
+It runs STANDALONE — no separate backend server needed!
 
-1. Sign up / Log in using Supabase authentication
-2. Enter customer data manually (form)
-3. Upload a CSV file for batch predictions
-4. See prediction results with visualizations
-5. View their prediction history
+It:
+1. Loads the ML model directly (from models/ folder)
+2. Handles Supabase authentication (signup/login)
+3. Lets users enter data manually or upload CSV
+4. Makes predictions and shows visualizations
+5. Stores predictions in Supabase database
 
-WHAT IS STREAMLIT?
-------------------
-Streamlit turns Python scripts into web apps — no HTML/CSS/JS needed!
-You write Python, and Streamlit renders it as a web page.
-
-HOW TO RUN:
+DEPLOYMENT:
 -----------
+This is designed for Streamlit Cloud deployment.
+The model is loaded directly from the repo — no FastAPI backend needed.
+
+HOW TO RUN LOCALLY:
+-------------------
     cd frontend
     pip install -r requirements.txt
     streamlit run app.py
-
-Then open http://localhost:8501 in your browser.
 ==========================================================
 """
 
 import streamlit as st
-import requests
 import pandas as pd
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import joblib
 import os
 import json
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from pathlib import Path
 
 # ──────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────
-# The URL of our FastAPI backend
-API_URL = os.getenv("API_URL", "http://localhost:8000")
+# Supabase credentials — read from Streamlit secrets (cloud) or .env (local)
+def get_config(key, default=""):
+    """Read config from Streamlit secrets first, then env vars, then default."""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return os.getenv(key, default)
 
-# Supabase credentials
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL = get_config("SUPABASE_URL")
+SUPABASE_KEY = get_config("SUPABASE_KEY")
 
 
 # ──────────────────────────────────────────────────────────
-# HELPER: Initialize Supabase client
+# ML MODEL — Load directly (no backend needed)
 # ──────────────────────────────────────────────────────────
+@st.cache_resource
+def load_model():
+    """
+    Load the trained ML model, feature names, and label encoders.
+    Uses @st.cache_resource so the model is loaded ONCE and reused.
+    """
+    # Find the models directory (works both locally and on Streamlit Cloud)
+    # Locally: frontend/ -> ../models/
+    # Streamlit Cloud: the repo root has models/
+    current_dir = Path(__file__).parent
+    models_dir = current_dir.parent / "models"
+
+    if not models_dir.exists():
+        return None, None, None
+
+    try:
+        model = joblib.load(models_dir / "model.pkl")
+        feature_names = joblib.load(models_dir / "feature_names.pkl")
+        label_encoders = joblib.load(models_dir / "label_encoders.pkl")
+        return model, feature_names, label_encoders
+    except Exception as e:
+        st.error(f"❌ Failed to load model: {e}")
+        return None, None, None
+
+
+def predict_single(customer_data: dict, model, feature_names, label_encoders):
+    """
+    Make a churn prediction for a single customer.
+    This replaces the backend API call — runs the model directly.
+    """
+    try:
+        df = pd.DataFrame([customer_data])
+
+        # Encode categorical columns
+        for col, encoder in label_encoders.items():
+            if col in df.columns:
+                known_classes = set(encoder.classes_)
+                df[col] = df[col].apply(
+                    lambda x: encoder.transform([x])[0] if x in known_classes else -1
+                )
+
+        # Reorder columns to match training order
+        df = df[feature_names]
+
+        # Predict
+        prediction = int(model.predict(df)[0])
+        probabilities = model.predict_proba(df)[0]
+        confidence = float(max(probabilities))
+
+        prediction_label = "Will Churn" if prediction == 1 else "Will Not Churn"
+
+        if prediction == 1:
+            message = (
+                f"⚠️ This customer is likely to churn "
+                f"(confidence: {confidence:.1%}). "
+                f"Consider offering retention incentives."
+            )
+        else:
+            message = (
+                f"✅ This customer is likely to stay "
+                f"(confidence: {confidence:.1%}). "
+                f"Keep up the good service!"
+            )
+
+        return {
+            "prediction": prediction,
+            "prediction_label": prediction_label,
+            "confidence": round(confidence, 4),
+            "message": message
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ──────────────────────────────────────────────────────────
+# SUPABASE — Authentication & Database
+# ──────────────────────────────────────────────────────────
+@st.cache_resource
 def get_supabase():
     """Get or create a Supabase client."""
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -67,54 +146,20 @@ def get_supabase():
         return None
 
 
-# ──────────────────────────────────────────────────────────
-# HELPER: Make API calls to the backend
-# ──────────────────────────────────────────────────────────
-def call_api(endpoint: str, method: str = "GET", data: dict = None, token: str = None) -> dict:
-    """
-    Make an HTTP request to the backend API.
-
-    Args:
-        endpoint: API endpoint (e.g., "/predict")
-        method: HTTP method ("GET" or "POST")
-        data: Request body (for POST requests)
-        token: Supabase auth token (optional)
-
-    Returns:
-        Response JSON as a dictionary
-    """
-    url = f"{API_URL}{endpoint}"
-    headers = {"Content-Type": "application/json"}
-
-    # Add auth token if available
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
+def store_prediction_to_db(supabase_client, user_id, customer_data, prediction, prediction_label, confidence):
+    """Store a prediction in Supabase."""
+    if supabase_client is None:
+        return
     try:
-        if method == "POST":
-            response = requests.post(url, json=data, headers=headers, timeout=30)
-        else:
-            response = requests.get(url, headers=headers, timeout=30)
-
-        if response.status_code == 200:
-            return {"success": True, "data": response.json()}
-        else:
-            error_detail = response.json().get("detail", response.text)
-            return {"success": False, "error": f"API Error ({response.status_code}): {error_detail}"}
-
-    except requests.ConnectionError:
-        return {
-            "success": False,
-            "error": (
-                "❌ Cannot connect to the backend API.\n\n"
-                f"Make sure the backend is running at: {API_URL}\n\n"
-                "Start it with: `cd backend && uvicorn app.main:app --reload`"
-            )
-        }
-    except requests.Timeout:
-        return {"success": False, "error": "❌ API request timed out. Please try again."}
+        supabase_client.table("predictions").insert({
+            "user_id": user_id,
+            "customer_data": customer_data,
+            "prediction": prediction,
+            "prediction_label": prediction_label,
+            "confidence": confidence
+        }).execute()
     except Exception as e:
-        return {"success": False, "error": f"❌ Unexpected error: {str(e)}"}
+        st.warning(f"Could not save prediction: {e}")
 
 
 # ──────────────────────────────────────────────────────────
@@ -127,13 +172,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-
 # ──────────────────────────────────────────────────────────
-# CUSTOM CSS for better styling
+# CUSTOM CSS
 # ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Main header styling */
     .main-header {
         text-align: center;
         padding: 1rem 0;
@@ -142,16 +185,9 @@ st.markdown("""
         margin-bottom: 2rem;
         color: white;
     }
-    .main-header h1 {
-        color: white !important;
-        margin-bottom: 0.3rem;
-    }
-    .main-header p {
-        color: rgba(255,255,255,0.85);
-        font-size: 1.1rem;
-    }
+    .main-header h1 { color: white !important; margin-bottom: 0.3rem; }
+    .main-header p { color: rgba(255,255,255,0.85); font-size: 1.1rem; }
 
-    /* Metric cards */
     .metric-card {
         background: linear-gradient(135deg, #1e1e2e, #2d2d44);
         border: 1px solid #3d3d5c;
@@ -159,18 +195,9 @@ st.markdown("""
         padding: 1.2rem;
         text-align: center;
     }
-    .metric-card h3 {
-        color: #a0a0cc;
-        font-size: 0.85rem;
-        margin-bottom: 0.3rem;
-    }
-    .metric-card .value {
-        font-size: 1.8rem;
-        font-weight: bold;
-        color: #fafafa;
-    }
+    .metric-card h3 { color: #a0a0cc; font-size: 0.85rem; margin-bottom: 0.3rem; }
+    .metric-card .value { font-size: 1.8rem; font-weight: bold; color: #fafafa; }
 
-    /* Result styling */
     .prediction-churn {
         background: linear-gradient(135deg, #ff6b6b22, #ff535322);
         border: 2px solid #ff6b6b;
@@ -186,11 +213,9 @@ st.markdown("""
         text-align: center;
     }
 
-    /* Hide Streamlit's default menu and footer */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 
-    /* Sidebar styling */
     .sidebar-info {
         background: #1e1e2e;
         border-radius: 8px;
@@ -203,16 +228,24 @@ st.markdown("""
 
 
 # ──────────────────────────────────────────────────────────
-# SESSION STATE — persists data across Streamlit reruns
+# SESSION STATE
 # ──────────────────────────────────────────────────────────
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 if "user_email" not in st.session_state:
     st.session_state.user_email = None
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
 if "access_token" not in st.session_state:
     st.session_state.access_token = None
 if "predictions" not in st.session_state:
     st.session_state.predictions = []
+
+
+# ──────────────────────────────────────────────────────────
+# LOAD MODEL
+# ──────────────────────────────────────────────────────────
+model, feature_names, label_encoders = load_model()
 
 
 # ──────────────────────────────────────────────────────────
@@ -240,11 +273,11 @@ with st.sidebar:
                     pass
                 st.session_state.authenticated = False
                 st.session_state.user_email = None
+                st.session_state.user_id = None
                 st.session_state.access_token = None
                 st.rerun()
         else:
             auth_tab = st.radio("Choose:", ["Login", "Sign Up"], horizontal=True)
-
             email = st.text_input("📧 Email", placeholder="you@example.com")
             password = st.text_input("🔑 Password", type="password", placeholder="Min 6 characters")
 
@@ -260,13 +293,13 @@ with st.sidebar:
                             })
                             st.session_state.authenticated = True
                             st.session_state.user_email = response.user.email
+                            st.session_state.user_id = str(response.user.id)
                             st.session_state.access_token = response.session.access_token
                             st.success("✅ Login successful!")
                             st.rerun()
                         except Exception as e:
                             st.error(f"❌ Login failed: {str(e)}")
-
-            else:  # Sign Up
+            else:
                 if st.button("📝 Sign Up", use_container_width=True):
                     if not email or not password:
                         st.error("Please enter email and password.")
@@ -274,7 +307,7 @@ with st.sidebar:
                         st.error("Password must be at least 6 characters.")
                     else:
                         try:
-                            response = supabase_client.auth.sign_up({
+                            supabase_client.auth.sign_up({
                                 "email": email,
                                 "password": password
                             })
@@ -285,7 +318,6 @@ with st.sidebar:
                         except Exception as e:
                             st.error(f"❌ Sign up failed: {str(e)}")
 
-    # Sidebar info
     st.markdown("---")
     st.markdown("""
     <div class="sidebar-info">
@@ -310,51 +342,46 @@ st.markdown("""
 
 
 # ──────────────────────────────────────────────────────────
-# API STATUS CHECK
+# STATUS CARDS
 # ──────────────────────────────────────────────────────────
-api_status = call_api("/health")
-if api_status["success"]:
-    health = api_status["data"]
-    cols = st.columns(3)
-    with cols[0]:
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>API Status</h3>
-            <div class="value">✅ Online</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with cols[1]:
-        model_status = "✅ Loaded" if health.get("model_loaded") else "❌ Not Loaded"
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>ML Model</h3>
-            <div class="value">{model_status}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    with cols[2]:
-        auth_status = f"✅ {st.session_state.user_email}" if st.session_state.authenticated else "🔓 Guest"
-        st.markdown(f"""
-        <div class="metric-card">
-            <h3>User</h3>
-            <div class="value" style="font-size: 1rem;">{auth_status}</div>
-        </div>
-        """, unsafe_allow_html=True)
-else:
-    st.error(api_status.get("error", "Cannot connect to backend API."))
-    st.info(
-        "💡 **To start the backend:**\n\n"
-        "```bash\n"
-        "cd backend\n"
-        "pip install -r requirements.txt\n"
-        "uvicorn app.main:app --reload\n"
-        "```"
+cols = st.columns(3)
+with cols[0]:
+    model_status = "✅ Loaded" if model is not None else "❌ Not Found"
+    st.markdown(f"""
+    <div class="metric-card">
+        <h3>ML Model</h3>
+        <div class="value">{model_status}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with cols[1]:
+    db_status = "✅ Connected" if supabase_client is not None else "⚠️ Not Set"
+    st.markdown(f"""
+    <div class="metric-card">
+        <h3>Database</h3>
+        <div class="value">{db_status}</div>
+    </div>
+    """, unsafe_allow_html=True)
+with cols[2]:
+    auth_status = f"✅ {st.session_state.user_email}" if st.session_state.authenticated else "🔓 Guest"
+    st.markdown(f"""
+    <div class="metric-card">
+        <h3>User</h3>
+        <div class="value" style="font-size: 1rem;">{auth_status}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+if model is None:
+    st.error(
+        "❌ **Model not found!** Make sure `models/model.pkl` exists.\n\n"
+        "Run: `cd model_training && python train.py`"
     )
+    st.stop()
 
 st.markdown("---")
 
 
 # ──────────────────────────────────────────────────────────
-# TABS — Different ways to use the app
+# TABS
 # ──────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4 = st.tabs([
     "📝 Single Prediction",
@@ -371,24 +398,42 @@ with tab1:
     st.markdown("### 📝 Predict Churn for One Customer")
     st.markdown("Fill in the customer details below and click **Predict**.")
 
-    # Create a form with two columns
     col1, col2 = st.columns(2)
 
     with col1:
         gender = st.selectbox("👤 Gender", ["Male", "Female"])
-        senior_citizen = st.selectbox("👴 Senior Citizen", [0, 1], format_func=lambda x: "Yes" if x == 1 else "No")
-        tenure = st.slider("📅 Tenure (months)", min_value=0, max_value=72, value=12, help="How many months has this customer been with our company?")
-        monthly_charges = st.number_input("💰 Monthly Charges ($)", min_value=0.0, max_value=200.0, value=29.85, step=0.01)
+        senior_citizen = st.selectbox(
+            "👴 Senior Citizen", [0, 1],
+            format_func=lambda x: "Yes" if x == 1 else "No"
+        )
+        tenure = st.slider(
+            "📅 Tenure (months)", min_value=0, max_value=72, value=12,
+            help="How many months has this customer been with our company?"
+        )
+        monthly_charges = st.number_input(
+            "💰 Monthly Charges ($)", min_value=0.0, max_value=200.0,
+            value=29.85, step=0.01
+        )
 
     with col2:
-        total_charges = st.number_input("💵 Total Charges ($)", min_value=0.0, max_value=10000.0, value=358.20, step=0.01)
-        contract_type = st.selectbox("📋 Contract Type", ["Month-to-month", "One year", "Two year"])
-        internet_service = st.selectbox("🌐 Internet Service", ["DSL", "Fiber optic", "No"])
-        payment_method = st.selectbox("💳 Payment Method", ["Electronic check", "Mailed check", "Bank transfer", "Credit card"])
+        total_charges = st.number_input(
+            "💵 Total Charges ($)", min_value=0.0, max_value=10000.0,
+            value=358.20, step=0.01
+        )
+        contract_type = st.selectbox(
+            "📋 Contract Type",
+            ["Month-to-month", "One year", "Two year"]
+        )
+        internet_service = st.selectbox(
+            "🌐 Internet Service", ["DSL", "Fiber optic", "No"]
+        )
+        payment_method = st.selectbox(
+            "💳 Payment Method",
+            ["Electronic check", "Mailed check", "Bank transfer", "Credit card"]
+        )
 
     st.markdown("")
     if st.button("🔮 Predict Churn", use_container_width=True, type="primary"):
-        # Build the customer data dictionary
         customer_data = {
             "gender": gender,
             "senior_citizen": senior_citizen,
@@ -400,42 +445,45 @@ with tab1:
             "payment_method": payment_method
         }
 
-        # Call the backend API
         with st.spinner("🔄 Making prediction..."):
-            result = call_api(
-                "/predict",
-                method="POST",
-                data=customer_data,
-                token=st.session_state.access_token
-            )
+            result = predict_single(customer_data, model, feature_names, label_encoders)
 
-        if result["success"]:
-            prediction = result["data"]
-            st.session_state.predictions.append(prediction)
+        if "error" in result:
+            st.error(f"❌ Prediction failed: {result['error']}")
+        else:
+            st.session_state.predictions.append(result)
 
-            # Display result with styling
-            if prediction["prediction"] == 1:
+            # Save to Supabase if authenticated
+            if st.session_state.authenticated and supabase_client:
+                store_prediction_to_db(
+                    supabase_client,
+                    st.session_state.user_id,
+                    customer_data,
+                    result["prediction"],
+                    result["prediction_label"],
+                    result["confidence"]
+                )
+
+            # Display result
+            if result["prediction"] == 1:
                 st.markdown(f"""
                 <div class="prediction-churn">
                     <h2>⚠️ CHURN RISK DETECTED</h2>
-                    <p style="font-size: 1.2rem;">{prediction['message']}</p>
-                    <p style="font-size: 0.9rem; opacity: 0.7;">Confidence: {prediction['confidence']:.1%}</p>
+                    <p style="font-size: 1.2rem;">{result['message']}</p>
+                    <p style="font-size: 0.9rem; opacity: 0.7;">Confidence: {result['confidence']:.1%}</p>
                 </div>
                 """, unsafe_allow_html=True)
             else:
                 st.markdown(f"""
                 <div class="prediction-no-churn">
                     <h2>✅ CUSTOMER WILL STAY</h2>
-                    <p style="font-size: 1.2rem;">{prediction['message']}</p>
-                    <p style="font-size: 0.9rem; opacity: 0.7;">Confidence: {prediction['confidence']:.1%}</p>
+                    <p style="font-size: 1.2rem;">{result['message']}</p>
+                    <p style="font-size: 0.9rem; opacity: 0.7;">Confidence: {result['confidence']:.1%}</p>
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Show raw data in an expander
-            with st.expander("🔍 View raw API response"):
-                st.json(prediction)
-        else:
-            st.error(result["error"])
+            with st.expander("🔍 View raw prediction data"):
+                st.json(result)
 
 
 # ──────────────────────────────────────────────────────────
@@ -444,12 +492,12 @@ with tab1:
 with tab2:
     st.markdown("### 📁 Upload CSV for Batch Predictions")
     st.markdown(
-        "Upload a CSV file with customer data. The file should have these columns:\n"
+        "Upload a CSV file with customer data. Required columns:\n"
         "`gender`, `senior_citizen`, `tenure`, `monthly_charges`, `total_charges`, "
         "`contract_type`, `internet_service`, `payment_method`"
     )
 
-    # Download sample CSV
+    # Show sample format
     st.markdown("**Need a sample?** Here's the expected format:")
     sample_df = pd.DataFrame([
         {
@@ -467,7 +515,6 @@ with tab2:
     ])
     st.dataframe(sample_df, use_container_width=True)
 
-    # File uploader
     uploaded_file = st.file_uploader("📂 Choose a CSV file", type=["csv"])
 
     if uploaded_file is not None:
@@ -476,7 +523,6 @@ with tab2:
             st.markdown(f"**Loaded {len(df)} rows**")
             st.dataframe(df.head(10), use_container_width=True)
 
-            # Required columns
             required_cols = [
                 "gender", "senior_citizen", "tenure", "monthly_charges",
                 "total_charges", "contract_type", "internet_service", "payment_method"
@@ -487,50 +533,63 @@ with tab2:
                 st.error(f"❌ Missing columns: {', '.join(missing_cols)}")
             else:
                 if st.button("🔮 Predict All Customers", use_container_width=True, type="primary"):
-                    # Prepare batch data
-                    customers = df[required_cols].to_dict(orient="records")
-                    batch_data = {"customers": customers}
+                    predictions = []
+                    churn_count = 0
 
-                    with st.spinner(f"🔄 Processing {len(customers)} customers..."):
-                        result = call_api(
-                            "/batch-predict",
-                            method="POST",
-                            data=batch_data,
-                            token=st.session_state.access_token
-                        )
+                    progress_bar = st.progress(0)
+                    total = len(df)
 
-                    if result["success"]:
-                        batch_result = result["data"]
+                    for i, (_, row) in enumerate(df[required_cols].iterrows()):
+                        customer_data = row.to_dict()
+                        result = predict_single(customer_data, model, feature_names, label_encoders)
 
-                        # Summary metrics
-                        st.markdown("### 📊 Results Summary")
-                        m1, m2, m3 = st.columns(3)
-                        with m1:
-                            st.metric("Total Customers", batch_result["total_customers"])
-                        with m2:
-                            st.metric("Predicted to Churn", batch_result["churn_count"])
-                        with m3:
-                            st.metric("Churn Rate", f"{batch_result['churn_rate']:.1f}%")
+                        if "error" not in result:
+                            predictions.append(result)
+                            if result["prediction"] == 1:
+                                churn_count += 1
 
-                        # Add predictions to the original dataframe
-                        preds = batch_result["predictions"]
-                        df["Prediction"] = [p["prediction_label"] for p in preds]
-                        df["Confidence"] = [f"{p['confidence']:.1%}" for p in preds]
+                            # Save to Supabase
+                            if st.session_state.authenticated and supabase_client:
+                                store_prediction_to_db(
+                                    supabase_client,
+                                    st.session_state.user_id,
+                                    customer_data,
+                                    result["prediction"],
+                                    result["prediction_label"],
+                                    result["confidence"]
+                                )
 
-                        st.markdown("### 📋 Detailed Results")
-                        st.dataframe(df, use_container_width=True)
+                        progress_bar.progress((i + 1) / total)
 
-                        # Download results as CSV
-                        csv_output = df.to_csv(index=False)
-                        st.download_button(
-                            "📥 Download Results CSV",
-                            csv_output,
-                            "churn_predictions.csv",
-                            "text/csv",
-                            use_container_width=True
-                        )
-                    else:
-                        st.error(result["error"])
+                    st.session_state.predictions.extend(predictions)
+
+                    # Summary
+                    st.markdown("### 📊 Results Summary")
+                    m1, m2, m3 = st.columns(3)
+                    with m1:
+                        st.metric("Total Customers", len(predictions))
+                    with m2:
+                        st.metric("Predicted to Churn", churn_count)
+                    with m3:
+                        rate = (churn_count / len(predictions) * 100) if predictions else 0
+                        st.metric("Churn Rate", f"{rate:.1f}%")
+
+                    # Add predictions to dataframe
+                    df["Prediction"] = [p["prediction_label"] for p in predictions]
+                    df["Confidence"] = [f"{p['confidence']:.1%}" for p in predictions]
+
+                    st.markdown("### 📋 Detailed Results")
+                    st.dataframe(df, use_container_width=True)
+
+                    # Download
+                    csv_output = df.to_csv(index=False)
+                    st.download_button(
+                        "📥 Download Results CSV",
+                        csv_output,
+                        "churn_predictions.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
 
         except Exception as e:
             st.error(f"❌ Error reading CSV: {str(e)}")
@@ -550,7 +609,7 @@ with tab3:
     else:
         predictions = st.session_state.predictions
 
-        # ---- Chart 1: Prediction Distribution (Pie Chart) ----
+        # Pie Chart
         st.markdown("#### 🥧 Prediction Distribution")
         churn_count = sum(1 for p in predictions if p["prediction"] == 1)
         no_churn_count = len(predictions) - churn_count
@@ -575,15 +634,14 @@ with tab3:
         else:
             ax1.pie(
                 sizes, labels=labels, colors=colors,
-                startangle=90,
-                textprops={"color": "white", "fontsize": 10}
+                startangle=90, textprops={"color": "white", "fontsize": 10}
             )
 
         ax1.set_title("Churn Prediction Results", color="white", fontsize=14, fontweight="bold")
         st.pyplot(fig1)
         plt.close(fig1)
 
-        # ---- Chart 2: Confidence Distribution (Histogram) ----
+        # Confidence Histogram
         st.markdown("#### 📈 Confidence Distribution")
         confidences = [p["confidence"] for p in predictions]
 
@@ -604,10 +662,10 @@ with tab3:
         st.pyplot(fig2)
         plt.close(fig2)
 
-        # ---- Chart 3: Predictions Over Time (Bar Chart) ----
+        # Bar Chart
         st.markdown("#### 📊 Predictions Breakdown")
-
         pred_labels = [p["prediction_label"] for p in predictions]
+
         fig3, ax3 = plt.subplots(figsize=(6, 4))
         fig3.patch.set_facecolor("#0E1117")
         ax3.set_facecolor("#1E1E2E")
@@ -643,41 +701,36 @@ with tab4:
         st.info(
             "🔐 **Login required** to view saved prediction history.\n\n"
             "Use the sidebar to log in with your Supabase account.\n\n"
-            "Without login, predictions from this session are shown below."
+            "Without login, only this session's predictions are shown below."
         )
-
-        # Show session predictions
-        if st.session_state.predictions:
-            st.markdown("#### 📋 This Session's Predictions")
-            session_df = pd.DataFrame(st.session_state.predictions)
-            st.dataframe(session_df, use_container_width=True)
-        else:
-            st.info("No predictions made yet in this session.")
     else:
-        # Fetch from Supabase via the backend
-        result = call_api(
-            "/predictions?limit=50",
-            method="GET",
-            token=st.session_state.access_token
-        )
+        # Fetch from Supabase
+        if supabase_client:
+            try:
+                result = (
+                    supabase_client.table("predictions")
+                    .select("*")
+                    .eq("user_id", st.session_state.user_id)
+                    .order("created_at", desc=True)
+                    .limit(50)
+                    .execute()
+                )
+                if result.data:
+                    st.markdown(f"**Showing {len(result.data)} saved predictions**")
+                    history_df = pd.DataFrame(result.data)
+                    st.dataframe(history_df, use_container_width=True)
+                else:
+                    st.info("No saved predictions yet. Make some predictions to see them here!")
+            except Exception as e:
+                st.warning(f"Could not fetch history: {e}")
 
-        if result["success"]:
-            data = result["data"]
-            st.markdown(f"**Showing {data['total']} saved predictions for {data['user_email']}**")
-
-            if data["predictions"]:
-                history_df = pd.DataFrame(data["predictions"])
-                st.dataframe(history_df, use_container_width=True)
-            else:
-                st.info("No saved predictions yet. Make some predictions to see them here!")
-        else:
-            st.warning(result["error"])
-
-        # Also show current session predictions
-        if st.session_state.predictions:
-            st.markdown("#### 📋 This Session's Predictions")
-            session_df = pd.DataFrame(st.session_state.predictions)
-            st.dataframe(session_df, use_container_width=True)
+    # Show session predictions
+    if st.session_state.predictions:
+        st.markdown("#### 📋 This Session's Predictions")
+        session_df = pd.DataFrame(st.session_state.predictions)
+        st.dataframe(session_df, use_container_width=True)
+    elif not st.session_state.authenticated:
+        st.info("No predictions made yet in this session.")
 
 
 # ──────────────────────────────────────────────────────────
@@ -686,7 +739,7 @@ with tab4:
 st.markdown("---")
 st.markdown(
     "<p style='text-align: center; color: #666;'>"
-    "🔮 Customer Churn Prediction System | Built with FastAPI + Streamlit + Scikit-learn"
+    "🔮 Customer Churn Prediction System | Built with Streamlit + Scikit-learn + Supabase"
     "</p>",
     unsafe_allow_html=True
 )
